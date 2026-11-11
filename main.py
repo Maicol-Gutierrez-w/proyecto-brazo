@@ -13,7 +13,7 @@ from PyQt6.QtCore import Qt
 from OpenGL.GL import *
 from OpenGL.GLU import *
 
-# Si alguna articulación gira al revés de lo esperado, cambia su signo aquí (1 o -1)
+# Signos de rotación
 SIGNOS = {
     "gira_base": 1,
     "brazo_1": 1,
@@ -26,7 +26,8 @@ SIGNOS = {
 PREFIJO = "Brazo ensamblado - "
 
 GRIS = (0.25, 0.25, 0.25)
-# nombre del archivo (sin prefijo ni .STL) -> color
+
+# Piezas y colores RGB
 PIEZAS = {
     "base del brazo-1": (0.85, 0.65, 0.10),
     "base 2 mano-4": (0.15, 0.35, 0.85),
@@ -40,22 +41,21 @@ PIEZAS = {
     "pin 20mm-1": GRIS, "pin 20mm-2": GRIS, "pin 20mm-3": GRIS,
 }
 
-# Vistas predefinidas: (rotacion_x, rotacion_y) en el marco ALINEADO del modelo
-# (arriba = eje de la base, adelante = dirección en que el brazo se extiende en reposo).
-# Ajusta aquí si quieres afinar: en "Cámara libre" la consola imprime los ángulos al soltar el mouse.
+# Vistas predefinidas
 VISTAS = {
-    "superior":   (75.0, 0.0),        # imagen 1: desde arriba, brazo extendiéndose hacia abajo
-    "isometrica": (35.264, -135.0),   # imagen 2: desde arriba en diagonal
-    "lateral":    (15.0, 90.0),       # imagen 3: de perfil (mirando a lo largo del eje del hombro)
+    "superior":   (75.0, 0.0),
+    "isometrica": (35.264, -135.0),
+    "lateral":    (15.0, 90.0),
 }
 
-# articulación -> (slider que la controla, factor)
+# Mapeo junta-slider
 JUNTA_SLIDER = {
     "pinza_izq": ("pinzas", 0.35),
     "pinza_der": ("pinzas", -0.35),
 }
 
 
+# Normalización
 def normalizar(v, defecto=None):
     n = np.linalg.norm(v)
     if n < 1e-9:
@@ -63,12 +63,11 @@ def normalizar(v, defecto=None):
     return v / n
 
 
+# Eje cilindro / PCA
 def eje_cilindro(vertices):
-    """Devuelve el eje de simetría de una pieza cilíndrica (pasador) usando PCA.
-    El eje es el autovector 'distinto' de los otros dos (que son casi iguales)."""
     c = vertices - vertices.mean(axis=0)
     cov = c.T @ c / len(c)
-    w, v = np.linalg.eigh(cov)  # ascendente
+    w, v = np.linalg.eigh(cov)
     idx = 2 if (w[1] - w[0]) < (w[2] - w[1]) else 0
     eje = v[:, idx]
     i = np.argmax(np.abs(eje))
@@ -77,6 +76,7 @@ def eje_cilindro(vertices):
     return eje / np.linalg.norm(eje)
 
 
+# Proyección perpendicular
 def perpendicular(v, eje):
     return v - np.dot(v, eje) * eje
 
@@ -86,20 +86,20 @@ class Visor3D(QOpenGLWidget):
     def __init__(self):
         super().__init__()
 
-        self.partes = {}          # clave corta -> datos de malla
-        self.grupo = {}           # clave -> nombre de articulación que la mueve (None = fija)
-        self.juntas = {}          # nombre -> (pivote, eje)
-        self.hijos = {}           # nombre (o None) -> [articulaciones hijas]
+        self.partes = {}
+        self.grupo = {}
+        self.juntas = {}
+        self.hijos = {}
 
-        # Cámara
+        # Cámara y transformación
         self.rotacion_x = 20
         self.rotacion_y = 30
         self.zoom = 1.0
         self.posicion_x = 0
         self.posicion_y = 0
         self.ultimo_mouse = None
-        self.rotacion_bloqueada = False   # True en las vistas fijas
-        self.mat_alineacion = np.eye(4, dtype=np.float32)  # modelo -> marco alineado (OpenGL)
+        self.rotacion_bloqueada = False
+        self.mat_alineacion = np.eye(4, dtype=np.float32)
 
         self.centro = np.zeros(3)
         self.escala = 1.0
@@ -111,7 +111,7 @@ class Visor3D(QOpenGLWidget):
 
         self.cargar_modelos()
 
-    # ------------------------------------------------------------------
+    # Carga STL y mallas
     def cargar_modelos(self):
         carpeta = "modelos_ensamblados"
         self.partes = {}
@@ -133,7 +133,6 @@ class Visor3D(QOpenGLWidget):
                 ln[ln == 0] = 1
                 n = n / ln
 
-                # nube de puntos densa para medir contactos entre piezas
                 rng = np.random.default_rng(0)
                 sub = verts[rng.choice(len(verts), min(len(verts), 400), replace=False)]
                 try:
@@ -161,20 +160,14 @@ class Visor3D(QOpenGLWidget):
             self.juntas, self.hijos = {}, {None: []}
         self.calcular_encuadre()
 
-    # ------------------------------------------------------------------
+    # Construcción cinemática
     def construir_cinematica(self):
-        """Deduce la jerarquía desde la geometría:
-        - cada pasador une las 2 piezas cuyos agujeros lo rodean;
-        - las uniones sin pasador (giro de base y de muñeca) se infieren por contacto;
-        - desde la base fija hacia afuera: al mover una articulación solo se mueve
-          lo que queda del lado lejano de ese pasador."""
         pernos = [k for k in self.partes if k.startswith("pin ")]
         piezas = [k for k in self.partes if not k.startswith("pin ")]
         if not piezas:
             return
         raiz = "base del brazo-1" if "base del brazo-1" in piezas else piezas[0]
 
-        # ---- geometría de cada pasador
         info = {}
         for k in pernos:
             v = self.partes[k]["vertices"]
@@ -185,7 +178,6 @@ class Visor3D(QOpenGLWidget):
             perp = np.linalg.norm(d - np.outer(along, e), axis=1)
             info[k] = {"c": c, "e": e, "r": perp.max(), "L": np.abs(along).max()}
 
-        # ---- qué piezas atraviesa cada pasador
         pieza_de_perno = {}
         for k in pernos:
             c, e, r, L = info[k]["c"], info[k]["e"], info[k]["r"], info[k]["L"]
@@ -203,13 +195,12 @@ class Visor3D(QOpenGLWidget):
             if len(elegidas) < 2:
                 print(f"[AVISO] {k}: solo se detectó {elegidas}")
 
-        # ---- distancia mínima entre piezas (para uniones sin pasador)
         def dist_min(a, b):
             A, B = self.partes[a]["puntos"], self.partes[b]["puntos"]
             d2 = (A ** 2).sum(1)[:, None] + (B ** 2).sum(1)[None, :] - 2 * A @ B.T
             return float(np.sqrt(max(d2.min(), 0.0)))
 
-        aristas = []   # (peso, a, b, perno)
+        aristas = []
         for k, ps in pieza_de_perno.items():
             if len(ps) == 2:
                 aristas.append((-1.0, ps[0], ps[1], k))
@@ -233,7 +224,6 @@ class Visor3D(QOpenGLWidget):
                 arbol[a].append((b, k))
                 arbol[b].append((a, k))
 
-        # ---- orientar el árbol desde la base fija
         padre, prof, orden, perno_arista = {raiz: None}, {raiz: 0}, [raiz], {}
         i = 0
         while i < len(orden):
@@ -245,7 +235,6 @@ class Visor3D(QOpenGLWidget):
                     perno_arista[v] = k
                     orden.append(v)
 
-        # ---- clasificar las uniones (de la base hacia afuera)
         hijas = [p for p in orden if p != raiz]
         pin20 = sorted([p for p in hijas if perno_arista[p] and "20mm" in perno_arista[p]], key=lambda p: prof[p])
         pin5 = sorted([p for p in hijas if perno_arista[p] and "5mm" in perno_arista[p]], key=lambda p: perno_arista[p])
@@ -259,13 +248,12 @@ class Visor3D(QOpenGLWidget):
         for p, n in zip(pin5, ["pinza_izq", "pinza_der"]):
             nombre_union[p] = n
 
-        # ---- grupo de cada pieza: la articulación que la mueve (la última de su cadena)
         self.grupo = {raiz: None}
         padre_junta = {}
         for p in orden[1:]:
             j = nombre_union.get(p)
             if j is None:
-                self.grupo[p] = self.grupo[padre[p]]       # unión rígida
+                self.grupo[p] = self.grupo[padre[p]]
             else:
                 self.grupo[p] = j
                 padre_junta[j] = self.grupo[padre[p]]
@@ -274,7 +262,7 @@ class Visor3D(QOpenGLWidget):
                 self.grupo[k] = None
                 continue
             hijo = max(ps, key=lambda p: prof.get(p, 0))
-            self.grupo[k] = self.grupo[hijo]               # el pasador viaja con el lado lejano
+            self.grupo[k] = self.grupo[hijo]
 
         self.hijos = {None: []}
         for j in padre_junta:
@@ -282,7 +270,6 @@ class Visor3D(QOpenGLWidget):
         for j, pj in padre_junta.items():
             self.hijos.setdefault(pj, []).append(j)
 
-        # ---- pivote y eje de cada articulación
         def pieza_de(j):
             return next((p for p, n in nombre_union.items() if n == j), None)
 
@@ -299,7 +286,6 @@ class Visor3D(QOpenGLWidget):
             tol = dm.min() + 0.03 * np.linalg.norm(A.max(0) - A.min(0))
             return A[dm <= tol].mean(axis=0)
 
-        # giro de la base: eje perpendicular al hombro, desde la base hacia el hombro
         pb = pieza_de("gira_base")
         if pb:
             if "brazo_1" in self.juntas:
@@ -311,9 +297,6 @@ class Visor3D(QOpenGLWidget):
                 e = np.array([0.0, 1.0, 0.0])
             self.juntas["gira_base"] = (contacto(padre[pb], pb), e)
 
-        # giro de la muñeca (roll): el eje va a lo largo del eslabón donde está la unión,
-        # perpendicular a los pasadores vecinos. Se calcula con el pasador anterior (lado
-        # de la base) y/o el siguiente (lado de las pinzas), sin importar en qué orden estén.
         pm = pieza_de("giro_muñeca")
         if pm:
             pp = padre[pm]
@@ -337,7 +320,6 @@ class Visor3D(QOpenGLWidget):
                 e = normalizar(self.partes[pm]["centro"] - centro_union, [0, 1, 0])
             self.juntas["giro_muñeca"] = (piv, e)
 
-        # lo que no se pudo detectar queda rígido (no se mueve)
         self.hijos = {k: [j for j in v if j in self.juntas] for k, v in self.hijos.items()}
         self.hijos.setdefault(None, [])
 
@@ -355,10 +337,8 @@ class Visor3D(QOpenGLWidget):
                 imprimir(h, nivel + 1)
         imprimir(None)
 
+    # Matriz de alineación
     def calcular_alineacion(self, raiz):
-        """Gira el modelo para que 'arriba' sea el eje de la base y 'adelante' la dirección
-        en que el brazo se extiende en reposo. Así las vistas no dependen de cómo
-        exportó SolidWorks los ejes."""
         self.mat_alineacion = np.eye(4, dtype=np.float32)
         try:
             if "gira_base" not in self.juntas or "brazo_1" not in self.juntas:
@@ -371,7 +351,6 @@ class Visor3D(QOpenGLWidget):
                 return
             f = normalizar(np.cross(u, s_))
 
-            # sentido de 'adelante': hacia donde apuntan las pinzas en reposo
             pinzas = [self.partes[k]["centro"] for k in self.partes if k.startswith("pinzas")]
             if pinzas:
                 d = np.mean(pinzas, axis=0) - self.juntas["brazo_1"][0]
@@ -379,15 +358,16 @@ class Visor3D(QOpenGLWidget):
                 if np.linalg.norm(d) > 1e-6 and np.dot(d, f) < 0:
                     f = -f
 
-            x_ = np.cross(u, f)                      # derecha = arriba x adelante
-            R = np.vstack([x_, u, f])                # filas: x', y', z'
+            x_ = np.cross(u, f)
+            R = np.vstack([x_, u, f])
             R4 = np.eye(4)
             R4[:3, :3] = R
-            self.mat_alineacion = np.ascontiguousarray(R4.T, dtype=np.float32)  # column-major
+            self.mat_alineacion = np.ascontiguousarray(R4.T, dtype=np.float32)
             print(f"Alineación: arriba={np.round(u,3)} adelante={np.round(f,3)} lateral={np.round(x_,3)}")
         except Exception as e:
             print(f"[AVISO] Alineación omitida: {e}")
 
+    # Encuadre y escala
     def calcular_encuadre(self):
         if not self.partes:
             return
@@ -398,7 +378,7 @@ class Visor3D(QOpenGLWidget):
         if mayor > 0:
             self.escala = 4.0 / mayor
 
-    # ------------------------------------------------------------------
+    # Inicialización OpenGL
     def initializeGL(self):
         glClearColor(0.08, 0.09, 0.12, 1.0)
         glEnable(GL_DEPTH_TEST)
@@ -412,6 +392,7 @@ class Visor3D(QOpenGLWidget):
         glEnable(GL_COLOR_MATERIAL)
         glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
 
+    # Redimensionamiento ventana
     def resizeGL(self, width, height):
         if height == 0:
             height = 1
@@ -421,13 +402,13 @@ class Visor3D(QOpenGLWidget):
         gluPerspective(45.0, width / height, 0.1, 1000.0)
         glMatrixMode(GL_MODELVIEW)
 
+    # Ángulo junta
     def angulo_junta(self, j):
         slider, factor = JUNTA_SLIDER.get(j, (j, 1.0))
         return self.articulaciones[slider] * SIGNOS[slider] * factor
 
+    # Renderizado recursivo junta
     def dibujar_junta(self, j):
-        """Aplica la rotación de j (sobre su pivote), dibuja solo lo que ella mueve
-        y anida las articulaciones siguientes. Lo que está del lado de la base no se toca."""
         pivote, eje = self.juntas[j]
         glPushMatrix()
         glTranslatef(*pivote)
@@ -440,6 +421,7 @@ class Visor3D(QOpenGLWidget):
             self.dibujar_junta(h)
         glPopMatrix()
 
+    # Renderizado principal OpenGL
     def paintGL(self):
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         glLoadIdentity()
@@ -458,6 +440,7 @@ class Visor3D(QOpenGLWidget):
         for j in self.hijos.get(None, []):
             self.dibujar_junta(j)
 
+    # Renderizado geometría pieza
     def dibujar_pieza(self, clave):
         m = self.partes.get(clave)
         if m is None:
@@ -471,10 +454,11 @@ class Visor3D(QOpenGLWidget):
         glDisableClientState(GL_NORMAL_ARRAY)
         glDisableClientState(GL_VERTEX_ARRAY)
 
-    # ------------------------------------------------------------------
+    # Presión mouse
     def mousePressEvent(self, event):
         self.ultimo_mouse = event.position()
 
+    # Movimiento mouse / rotación / pan
     def mouseMoveEvent(self, event):
         if self.ultimo_mouse is None:
             return
@@ -493,17 +477,19 @@ class Visor3D(QOpenGLWidget):
         self.ultimo_mouse = pos
         self.update()
 
+    # Soltar mouse
     def mouseReleaseEvent(self, event):
         if not self.rotacion_bloqueada:
             print(f"Cámara: rotacion_x={self.rotacion_x:.1f}  rotacion_y={self.rotacion_y:.1f}")
 
+    # Zoom mouse
     def wheelEvent(self, event):
         self.zoom *= 0.9 if event.angleDelta().y() > 0 else 1.1
         self.zoom = max(0.1, min(10.0, self.zoom))
         self.update()
 
+    # Cambio vista predefinida
     def poner_vista(self, rot_x, rot_y, bloquear=True):
-        """Coloca la cámara en una vista predefinida (zoom y desplazamiento al inicio)."""
         self.rotacion_x = rot_x
         self.rotacion_y = rot_y
         self.zoom = 1.0
@@ -512,18 +498,23 @@ class Visor3D(QOpenGLWidget):
         self.rotacion_bloqueada = bloquear
         self.update()
 
+    # Vista superior
     def vista_superior(self):
         self.poner_vista(*VISTAS["superior"])
 
+    # Vista lateral
     def vista_lateral(self):
         self.poner_vista(*VISTAS["lateral"])
 
+    # Vista isométrica
     def vista_isometrica(self):
         self.poner_vista(*VISTAS["isometrica"])
 
+    # Cámara libre
     def camara_libre(self):
-        self.rotacion_bloqueada = False   # conserva la vista actual y permite rotar
+        self.rotacion_bloqueada = False
 
+    # Reiniciar cámara
     def reiniciar_camara(self):
         self.rotacion_x = 20
         self.rotacion_y = 30
@@ -541,6 +532,7 @@ class VentanaPrincipal(QMainWindow):
         self.resize(1300, 800)
         self.crear_interfaz()
 
+    # Creación interfaz PyQt6
     def crear_interfaz(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -629,18 +621,21 @@ class VentanaPrincipal(QMainWindow):
             QSlider::handle:horizontal:hover { background: #10a5ba; }
         """)
 
+    # Actualización articulación y slider
     def actualizar_articulacion(self, clave, valor, label, nombre):
         unidad = "%" if clave == "pinzas" else "°"
         label.setText(f"{nombre}: {valor}{unidad}")
         self.visor.articulaciones[clave] = valor
         self.visor.update()
 
+    # Reiniciar cámara y vista UI
     def reiniciar(self):
         self.visor.reiniciar_camara()
         self.visor.rotacion_bloqueada = False
         self.botones_vista["Cámara libre"].setChecked(True)
 
 
+# Ejecución principal
 def main():
     app = QApplication(sys.argv)
     ventana = VentanaPrincipal()
